@@ -53,6 +53,8 @@ var (
 	StartRequestContextKey = &contextKey{"start-parse-request"}
 	// StartSendRequestContextKey records the start time
 	StartSendRequestContextKey = &contextKey{"start-send-request"}
+	// TagContextKey is used to record extra info in handling services. Its value is a map[string]interface{}
+	TagContextKey = &contextKey{"service-tag"}
 )
 
 // Server is rpcx server that use TCP or UDP.
@@ -77,10 +79,9 @@ type Server struct {
 	tlsConfig *tls.Config
 	// BlockCrypt for kcp.BlockCrypt
 	options map[string]interface{}
-	// // use for KCP
-	// KCPConfig KCPConfig
-	// // for QUIC
-	// QUICConfig QUICConfig
+
+	// CORS options
+	corsOptions *CORSOptions
 
 	Plugins PluginContainer
 
@@ -114,10 +115,11 @@ func (s *Server) Address() net.Addr {
 	return s.ln.Addr()
 }
 
+// ActiveClientConn returns active connections.
 func (s *Server) ActiveClientConn() []net.Conn {
 	var result []net.Conn
 
-	for clientConn, _ := range s.activeConn {
+	for clientConn := range s.activeConn {
 		result = append(result, clientConn)
 	}
 	return result
@@ -131,7 +133,7 @@ func (s *Server) ActiveClientConn() []net.Conn {
 //
 // servicePath, serviceMethod, metadata can be set to zero values.
 func (s *Server) SendMessage(conn net.Conn, servicePath, serviceMethod string, metadata map[string]string, data []byte) error {
-	ctx := context.WithValue(context.Background(), StartSendRequestContextKey, time.Now().UnixNano())
+	ctx := share.WithValue(context.Background(), StartSendRequestContextKey, time.Now().UnixNano())
 	s.Plugins.DoPreWriteRequest(ctx)
 
 	req := protocol.GetPooledMsg()
@@ -175,7 +177,6 @@ func (s *Server) startShutdownListener() {
 					sd(s)
 				}
 			}
-			os.Exit(0)
 		}
 	}(s)
 }
@@ -344,7 +345,8 @@ func (s *Server) serveConn(conn net.Conn) {
 			conn.SetReadDeadline(t0.Add(s.readTimeout))
 		}
 
-		ctx := context.WithValue(context.Background(), RemoteConnContextKey, conn)
+		ctx := share.WithValue(context.Background(), RemoteConnContextKey, conn)
+
 		req, err := s.readRequest(ctx, r)
 		if err != nil {
 			if err == io.EOF {
@@ -361,7 +363,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			conn.SetWriteDeadline(t0.Add(s.writeTimeout))
 		}
 
-		ctx = context.WithValue(ctx, StartRequestContextKey, time.Now().UnixNano())
+		ctx = share.WithLocalValue(ctx, StartRequestContextKey, time.Now().UnixNano())
 		if !req.IsHeartbeat() {
 			err = s.auth(ctx, req)
 		}
@@ -399,8 +401,10 @@ func (s *Server) serveConn(conn net.Conn) {
 			}
 
 			resMetadata := make(map[string]string)
-			newCtx := context.WithValue(context.WithValue(ctx, share.ReqMetaDataKey, req.Metadata),
+			newCtx := share.WithLocalValue(share.WithLocalValue(ctx, share.ReqMetaDataKey, req.Metadata),
 				share.ResMetaDataKey, resMetadata)
+
+			s.Plugins.DoPreHandleRequest(newCtx, req)
 
 			res, err := s.handleRequest(newCtx, req)
 
@@ -455,6 +459,9 @@ func (s *Server) readRequest(ctx context.Context, r io.Reader) (req *protocol.Me
 	// pool req?
 	req = protocol.GetPooledMsg()
 	err = req.Decode(r)
+	if err == io.EOF {
+		return req, err
+	}
 	perr := s.Plugins.DoPostReadRequest(ctx, req, err)
 	if err == nil {
 		err = perr

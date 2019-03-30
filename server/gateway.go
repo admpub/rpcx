@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,13 +25,24 @@ func (s *Server) startGateway(network string, ln net.Listener) net.Listener {
 
 	m := cmux.New(ln)
 
+	rpcxLn := m.Match(rpcxPrefixByteMatcher())
+	jsonrpc2Ln := m.Match(cmux.HTTP1HeaderField("X-JSONRPC-2.0", "true"))
 	httpLn := m.Match(cmux.HTTP1Fast())
-	rpcxLn := m.Match(cmux.Any())
 
+	go s.startJSONRPC2(jsonrpc2Ln)
 	go s.startHTTP1APIGateway(httpLn)
 	go m.Serve()
 
 	return rpcxLn
+}
+
+func rpcxPrefixByteMatcher() cmux.Matcher {
+	magic := protocol.MagicNumber()
+	return func(r io.Reader) bool {
+		buf := make([]byte, 1)
+		n, _ := r.Read(buf)
+		return n == 1 && buf[0] == magic
+	}
 }
 
 func (s *Server) startHTTP1APIGateway(ln net.Listener) {
@@ -65,7 +78,6 @@ func (s *Server) handleGatewayRequest(w http.ResponseWriter, r *http.Request, pa
 		r.Header.Set(XServicePath, servicePath)
 	}
 	servicePath := r.Header.Get(XServicePath)
-
 	wh := w.Header()
 	req, err := HTTPRequest2RpcxRequest(r)
 	defer protocol.FreeMsg(req)
@@ -73,9 +85,24 @@ func (s *Server) handleGatewayRequest(w http.ResponseWriter, r *http.Request, pa
 	//set headers
 	wh.Set(XVersion, r.Header.Get(XVersion))
 	wh.Set(XMessageID, r.Header.Get(XMessageID))
-	wh.Set(XServicePath, servicePath)
-	wh.Set(XServiceMethod, r.Header.Get(XServiceMethod))
-	wh.Set(XSerializeType, r.Header.Get(XSerializeType))
+
+	if err == nil && servicePath == "" {
+		err = errors.New("empty servicepath")
+	} else {
+		wh.Set(XServicePath, servicePath)
+	}
+
+	if err == nil && r.Header.Get(XServiceMethod) == "" {
+		err = errors.New("empty servicemethod")
+	} else {
+		wh.Set(XServiceMethod, r.Header.Get(XServiceMethod))
+	}
+
+	if err == nil && r.Header.Get(XSerializeType) == "" {
+		err = errors.New("empty serialized type")
+	} else {
+		wh.Set(XSerializeType, r.Header.Get(XSerializeType))
+	}
 
 	if err != nil {
 		rh := r.Header
